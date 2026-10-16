@@ -29,7 +29,10 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.mcpserver import MCPServer as FastMCP  # mcp >= 2.0
+except ImportError:
+    from mcp.server.fastmcp import FastMCP  # mcp 1.x
 
 from labmind.config import (
     ANOMALY_FEATURES,
@@ -44,6 +47,14 @@ logging.basicConfig(level=logging.INFO)
 # ── Initialize MCP Server ────────────────────────────────────────────────────
 
 mcp = FastMCP(SERVER_NAME)
+
+# Normal vitals used when predict_sepsis_risk is called without measurements
+DEFAULT_VITALS = {
+    "heart_rate": 80.0,
+    "systolic_bp": 120.0,
+    "temperature": 37.0,
+    "respiratory_rate": 16.0,
+}
 
 # ── Lazy-loaded singletons ────────────────────────────────────────────────────
 
@@ -300,10 +311,10 @@ def run_lab_anomaly_detector(
 @mcp.tool()
 def predict_sepsis_risk(
     patient_id: str,
-    heart_rate: float = 80.0,
-    systolic_bp: float = 120.0,
-    temperature: float = 37.0,
-    respiratory_rate: float = 16.0,
+    heart_rate: Optional[float] = None,
+    systolic_bp: Optional[float] = None,
+    temperature: Optional[float] = None,
+    respiratory_rate: Optional[float] = None,
 ) -> str:
     """
     Predict sepsis risk from a patient's latest labs and provided vitals.
@@ -311,12 +322,16 @@ def predict_sepsis_risk(
     Combines lab values with vital signs to run an XGBoost classifier,
     returning risk probability, SHAP-based explanations, and clinical recommendations.
 
+    Pass measured vitals whenever available. Omitted vitals are assumed normal
+    (HR 80, SBP 120, Temp 37.0, RR 16), which can understate risk; the report
+    marks them as assumed.
+
     Args:
         patient_id: Patient ID to fetch labs from (e.g., "P001").
-        heart_rate: Heart rate in bpm (default: 80).
-        systolic_bp: Systolic blood pressure in mmHg (default: 120).
-        temperature: Body temperature in °C (default: 37.0).
-        respiratory_rate: Respiratory rate in breaths/min (default: 16).
+        heart_rate: Heart rate in bpm.
+        systolic_bp: Systolic blood pressure in mmHg.
+        temperature: Body temperature in °C.
+        respiratory_rate: Respiratory rate in breaths/min.
     """
     try:
         predictor = _get_sepsis_predictor()
@@ -338,11 +353,16 @@ def predict_sepsis_risk(
             key = test_name.lower()
             lab_values[key] = result.value
 
-        # Add vitals
-        lab_values["heart_rate"] = heart_rate
-        lab_values["systolic_bp"] = systolic_bp
-        lab_values["temperature"] = temperature
-        lab_values["respiratory_rate"] = respiratory_rate
+        # Add vitals, falling back to normal values for any not provided
+        provided_vitals = {
+            "heart_rate": heart_rate,
+            "systolic_bp": systolic_bp,
+            "temperature": temperature,
+            "respiratory_rate": respiratory_rate,
+        }
+        assumed_vitals = [k for k, v in provided_vitals.items() if v is None]
+        for key, val in provided_vitals.items():
+            lab_values[key] = val if val is not None else DEFAULT_VITALS[key]
 
         result = predictor.predict(lab_values)
 
@@ -369,17 +389,28 @@ def predict_sepsis_risk(
         for feat in ["wbc", "hemoglobin", "platelets", "creatinine",
                       "lactate", "bun", "glucose", "potassium"]:
             val = lab_values.get(feat, None)
-            lines.append(
-                f"| Lab | {feat} | {val:.2f if val is not None else 'N/A'} |"
-            )
+            val_str = f"{val:.2f}" if val is not None else "N/A"
+            lines.append(f"| Lab | {feat} | {val_str} |")
 
         # Vitals
-        lines.extend([
-            f"| Vital | heart_rate | {heart_rate:.0f} bpm |",
-            f"| Vital | systolic_bp | {systolic_bp:.0f} mmHg |",
-            f"| Vital | temperature | {temperature:.1f} °C |",
-            f"| Vital | respiratory_rate | {respiratory_rate:.0f} /min |",
-        ])
+        for key, fmt, unit in [
+            ("heart_rate", ".0f", "bpm"),
+            ("systolic_bp", ".0f", "mmHg"),
+            ("temperature", ".1f", "°C"),
+            ("respiratory_rate", ".0f", "/min"),
+        ]:
+            note = " *(assumed)*" if key in assumed_vitals else ""
+            lines.append(
+                f"| Vital | {key} | {lab_values[key]:{fmt}} {unit}{note} |"
+            )
+
+        if assumed_vitals:
+            lines.extend([
+                "",
+                f"⚠️ **Vitals not provided — assumed normal:** "
+                f"{', '.join(assumed_vitals)}. Risk may be understated; "
+                f"re-run with measured vitals.",
+            ])
 
         # SHAP explanation
         if result.top_risk_factors:

@@ -23,35 +23,32 @@ from labmind.ml.sepsis_predictor import (
 )
 
 
-def train_anomaly_detector(db: LabDatabase) -> dict[str, float]:
-    """Train the Isolation Forest anomaly detector from historical lab data."""
-    print("\n" + "=" * 60)
-    print("🔬 Training Lab Anomaly Detector (Isolation Forest)")
-    print("=" * 60)
+def build_anomaly_training_frame(db: LabDatabase) -> pd.DataFrame:
+    """
+    Build one feature row per (patient, collection time) lab panel.
 
-    # Collect latest lab panels from all patients
-    patients = db.get_all_patients()
+    Uses every historical panel rather than only each patient's latest one:
+    latest panels over-represent the end stage of deteriorating patients,
+    which teaches the Isolation Forest that severe panels are normal.
+    """
     rows: list[dict[str, float]] = []
 
-    for patient in patients:
-        panel = db.get_latest_lab_panel(patient.patient_id)
-        if not panel:
-            continue
-
-        # Map test names to feature names (lowercase)
-        feature_map: dict[str, float] = {}
-        for test_name, result in panel.items():
-            key = test_name.lower()
+    for patient in db.get_all_patients():
+        panels: dict[str, dict[str, float]] = {}
+        # SQLite treats LIMIT -1 as "no limit"
+        for result in db.get_lab_results(patient.patient_id, limit=-1):
+            key = result.test_name.lower()
             if key in ANOMALY_FEATURES:
-                feature_map[key] = result.value
+                panels.setdefault(result.collection_datetime, {})[key] = result.value
 
-        # Only include if we have enough features
-        if len(feature_map) >= len(ANOMALY_FEATURES) * 0.7:
-            rows.append(feature_map)
+        # Only include panels with enough features
+        rows.extend(
+            panel for panel in panels.values()
+            if len(panel) >= len(ANOMALY_FEATURES) * 0.7
+        )
 
     if not rows:
-        print("❌ No suitable training data found. Seed the database first.")
-        return {}
+        return pd.DataFrame(columns=ANOMALY_FEATURES)
 
     df = pd.DataFrame(rows)
 
@@ -59,7 +56,19 @@ def train_anomaly_detector(db: LabDatabase) -> dict[str, float]:
     for feat in ANOMALY_FEATURES:
         if feat not in df.columns:
             df[feat] = np.nan
-    df = df[ANOMALY_FEATURES].fillna(df.mean())
+    return df[ANOMALY_FEATURES].fillna(df.mean())
+
+
+def train_anomaly_detector(db: LabDatabase) -> dict[str, float]:
+    """Train the Isolation Forest anomaly detector from historical lab data."""
+    print("\n" + "=" * 60)
+    print("🔬 Training Lab Anomaly Detector (Isolation Forest)")
+    print("=" * 60)
+
+    df = build_anomaly_training_frame(db)
+    if df.empty:
+        print("❌ No suitable training data found. Seed the database first.")
+        return {}
 
     print(f"   Training samples: {len(df)}")
     print(f"   Features: {list(df.columns)}")

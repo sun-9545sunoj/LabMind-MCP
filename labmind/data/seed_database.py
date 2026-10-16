@@ -147,7 +147,36 @@ def _seed_reference_ranges(conn: sqlite3.Connection) -> None:
     )
 
 
-def _generate_patient(idx: int) -> tuple[str, str, str, str, str, str, str]:
+def _generate_collection_times(
+    num_timepoints: int, reference_time: datetime
+) -> list[datetime]:
+    """
+    Generate strictly increasing collection times ending before reference_time.
+
+    Samples are 1–5 days apart, so the series always reaches the present
+    and stays inside the default trend look-back window.
+    """
+    day_offsets = [0]
+    for _ in range(num_timepoints - 1):
+        day_offsets.append(day_offsets[-1] + random.randint(1, 5))
+
+    # Last collection lands on the day before reference_time
+    start = (reference_time - timedelta(days=day_offsets[-1] + 1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return [
+        start + timedelta(
+            days=offset,
+            hours=random.randint(0, 23),
+            minutes=random.randint(0, 59),
+        )
+        for offset in day_offsets
+    ]
+
+
+def _generate_patient(
+    idx: int, reference_time: datetime, admission_time: datetime
+) -> tuple[str, str, str, str, str, str, str]:
     """Generate a single patient record."""
     patient_id = f"P{idx:03d}"
     mrn = f"MRN-{random.randint(100000, 999999)}"
@@ -161,12 +190,11 @@ def _generate_patient(idx: int) -> tuple[str, str, str, str, str, str, str]:
 
     # Age between 18 and 90
     age = random.randint(18, 90)
-    dob = datetime(2026, 1, 1) - timedelta(days=age * 365 + random.randint(0, 364))
+    dob = reference_time - timedelta(days=age * 365 + random.randint(0, 364))
     dob_str = dob.strftime("%Y-%m-%d")
 
-    # Admission: within last 30 days
-    admit = datetime(2026, 8, 1) - timedelta(days=random.randint(0, 30))
-    admit_str = admit.strftime("%Y-%m-%d")
+    # Admitted on the day of the first lab draw
+    admit_str = admission_time.strftime("%Y-%m-%d")
 
     return (patient_id, mrn, first_name, last_name, dob_str, gender, admit_str)
 
@@ -233,16 +261,24 @@ def _is_critical(test_code: str, value: float) -> bool:
     return False
 
 
-def seed_database(db_path: Path | None = None, num_patients: int = 60) -> None:
+def seed_database(
+    db_path: Path | None = None,
+    num_patients: int = 60,
+    reference_time: datetime | None = None,
+) -> None:
     """
     Create and populate the LabMind database with synthetic clinical data.
 
     Args:
         db_path: Path for the SQLite database. Defaults to config.DB_PATH.
         num_patients: Number of patients to generate (default 60).
+        reference_time: "Now" for the generated timeline; all collections fall
+            before it. Defaults to the current time.
     """
     if db_path is None:
         db_path = DB_PATH
+    if reference_time is None:
+        reference_time = datetime.now()
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -256,7 +292,7 @@ def seed_database(db_path: Path | None = None, num_patients: int = 60) -> None:
         _create_tables(conn)
         _seed_reference_ranges(conn)
 
-        # ── Generate patients ─────────────────────────────────────────────
+        # ── Generate patients and lab results ─────────────────────────────
         patients = []
         # Assign ~10% sepsis, ~8% AKI, rest healthy
         sepsis_ids = set(range(1, int(num_patients * 0.10) + 1))
@@ -265,18 +301,6 @@ def seed_database(db_path: Path | None = None, num_patients: int = 60) -> None:
             int(num_patients * 0.18) + 1,
         ))
 
-        for idx in range(1, num_patients + 1):
-            patient = _generate_patient(idx)
-            patients.append(patient)
-
-        conn.executemany(
-            """INSERT INTO patients
-               (patient_id, mrn, first_name, last_name, date_of_birth, gender, admission_date)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            patients,
-        )
-
-        # ── Generate lab results ──────────────────────────────────────────
         all_test_codes = [r[0] for r in REFERENCE_RANGES]
         lab_rows: list[tuple] = []
 
@@ -291,14 +315,14 @@ def seed_database(db_path: Path | None = None, num_patients: int = 60) -> None:
             else:
                 num_timepoints = random.randint(3, 8)
 
-            base_date = datetime(2026, 7, 1)
+            collection_times = _generate_collection_times(
+                num_timepoints, reference_time
+            )
+            patients.append(
+                _generate_patient(idx, reference_time, collection_times[0])
+            )
 
-            for t in range(num_timepoints):
-                collection_dt = base_date + timedelta(
-                    days=t * random.randint(1, 5),
-                    hours=random.randint(0, 23),
-                    minutes=random.randint(0, 59),
-                )
+            for t, collection_dt in enumerate(collection_times):
                 dt_str = collection_dt.strftime("%Y-%m-%dT%H:%M:%S")
 
                 for tc in all_test_codes:
@@ -318,6 +342,12 @@ def seed_database(db_path: Path | None = None, num_patients: int = 60) -> None:
                         ref_low, ref_high, dt_str, is_crit,
                     ))
 
+        conn.executemany(
+            """INSERT INTO patients
+               (patient_id, mrn, first_name, last_name, date_of_birth, gender, admission_date)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            patients,
+        )
         conn.executemany(
             """INSERT INTO lab_results
                (patient_id, test_code, test_name, value, unit,
